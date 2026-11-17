@@ -21,8 +21,17 @@ def latest_done() -> dict | None:
     )
 
 
+def get(backup_id: int) -> dict | None:
+    return state.one_row("SELECT * FROM backups WHERE id=?", (backup_id,))
+
+
+def generation_dir(bid: int) -> str:
+    """每一代备份使用独立目录，绝不原地覆盖（防止旧核验结论落到新备份上）。"""
+    return os.path.join(config.BACKUP_DIR, f"gen-{bid}")
+
+
 def start_backup(force: bool = False) -> int:
-    """启动一次基准备份（后台线程执行），返回 backups 表 id。"""
+    """启动一次基准备份（后台线程执行），返回 backups 表 id（即备份代次）。"""
     with _lock:
         if state.one_row("SELECT id FROM backups WHERE status='running' LIMIT 1"):
             raise BusyError("已有基准备份任务正在进行")
@@ -31,15 +40,18 @@ def start_backup(force: bool = False) -> int:
                             "（注意：早于新备份起点的核对点将过期）")
         bid = state.execute(
             "INSERT INTO backups (path, status, created_at) VALUES (?,?,?)",
-            (os.path.join(config.BACKUP_DIR, "base"), "running", state.now()),
+            (os.path.join(config.BACKUP_DIR, "pending"), "running", state.now()),
         )
+        # 代次目录在此刻即确定并落库，核验/恢复都按该路径与 id 绑定
+        state.execute("UPDATE backups SET path=? WHERE id=?",
+                      (generation_dir(bid), bid))
     threading.Thread(target=_run, args=(bid,), name=f"basebackup-{bid}", daemon=True).start()
     return bid
 
 
 def _run(bid: int) -> None:
     tmp = os.path.join(config.BACKUP_DIR, f".tmp-{bid}")
-    final = os.path.join(config.BACKUP_DIR, "base")
+    final = generation_dir(bid)
     try:
         shutil.rmtree(tmp, ignore_errors=True)
         env = dict(os.environ, PGPASSWORD=config.SOURCE_PASSWORD)
@@ -57,17 +69,14 @@ def _run(bid: int) -> None:
             check=True, env=env, capture_output=True, text=True, timeout=1800,
         )
         start_lsn, timeline = _read_start_lsn(tmp)
-        # 原子交换：先把旧备份挪走再换上新备份，避免恢复任务拷贝时遇到空窗
-        old = os.path.join(config.BACKUP_DIR, f".old-{bid}")
-        shutil.rmtree(old, ignore_errors=True)
-        if os.path.isdir(final):
-            os.rename(final, old)  # 旧备份被取代；过期核对点由刷新线程标记 expired
+        # 该代次目录独立，直接原子改名为 gen-<bid>；旧代次原样保留，
+        # 正在进行的旧代核验/恢复不会因新备份而被“换掉语义”。
+        shutil.rmtree(final, ignore_errors=True)
         os.rename(tmp, final)
-        shutil.rmtree(old, ignore_errors=True)
         state.execute(
-            "UPDATE backups SET status='done', start_lsn=?, timeline=?,"
+            "UPDATE backups SET path=?, status='done', start_lsn=?, timeline=?,"
             " size_bytes=?, finished_at=? WHERE id=?",
-            (start_lsn, timeline, _dir_size(final), state.now(), bid),
+            (final, start_lsn, timeline, _dir_size(final), state.now(), bid),
         )
     except Exception as e:  # noqa: BLE001 - 任何失败都如实落库
         shutil.rmtree(tmp, ignore_errors=True)

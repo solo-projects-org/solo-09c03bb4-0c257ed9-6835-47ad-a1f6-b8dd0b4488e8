@@ -16,7 +16,7 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
-from . import config, state, source
+from . import config, state, source, verifier
 from .walutil import lsn_to_int, wal_file_name
 
 
@@ -85,11 +85,16 @@ def run_job(job_id: int) -> None:
     ddir = os.path.join(config.RECOVERY_DIR, f"job-{job_id}")
     logfile = os.path.join(ddir, "server.log")
     started_pg = False
+    parked: list[dict] = []   # 被本任务临时停掉的旧 ready 实例（失败时可回滚）
     try:
         if not cp:
             raise RuntimeError(f"核对点 {job['checkpoint_name']} 不存在")
 
-        # 1) 等待 WAL 归档齐备（核对点落盘 + 备份起点到核对点的段全部在归档中）
+        # 1) 发布前的门槛先过：备份代次若已核验判坏/未通过，本任务直接失败，
+        #    不触碰当前已就绪的独立只读实例。
+        verifier.ensure_recovery_allowed()
+
+        # 2) 等待 WAL 归档齐备（核对点落盘 + 备份起点到核对点的段全部在归档中）
         state.update_job(job_id, status="waiting_wal", detail="等待核对点 WAL 归档")
         seg_size = source.wal_segment_size()
         backup = None
@@ -103,6 +108,11 @@ def run_job(job_id: int) -> None:
             )
             if not backup:
                 raise RuntimeError("没有可用的基准备份，请先 POST /api/basebackup")
+            if backup["id"] != job.get("backup_id"):
+                # 首次选定（或被更新的备份取代）时绑定代次，后续核验结论按代次校验
+                state.update_job(job_id, backup_id=backup["id"])
+                job["backup_id"] = backup["id"]
+            verifier.assert_job_backup_usable(backup["id"])
             if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
                 raise RuntimeError(
                     f"核对点 LSN {cp['restore_lsn']} 早于基准备份起点 "
@@ -118,12 +128,19 @@ def run_job(job_id: int) -> None:
                 )
             time.sleep(config.POLL_INTERVAL)
 
-        # 2) 一次只恢复一项：取代当前 ready 实例
-        _supersede_ready(job_id)
+        # 2) 发布前的门槛先过：备份代次若已核验判坏/未通过，本任务直接失败。
+        #    这一步排在“取代已就绪实例”之前，确保失败的恢复不会连累 ready 库。
+        verifier.assert_job_backup_usable(backup["id"])
 
-        # 3) 拷贝基准备份为独立数据目录
+        # 3) 一次只恢复一项：停掉当前 ready 实例（保留数据目录，失败可回滚）
+        parked = _supersede_ready(job_id)
+
+        # 4) 拷贝基准备份为独立数据目录
+        #    备份代次一旦被本任务采用即落库；核验若在后续任一时刻判坏该代次，
+        #    发布 ready 前会被 assert_job_backup_usable 拦下。
         state.update_job(job_id, status="preparing", detail="拷贝基准备份",
-                         data_dir=ddir, port=config.RECOVERY_PORT)
+                         data_dir=ddir, port=config.RECOVERY_PORT,
+                         backup_id=backup["id"])
         if _postgres_alive(ddir):
             stop_instance(ddir)
         shutil.rmtree(ddir, ignore_errors=True)
@@ -133,27 +150,32 @@ def run_job(job_id: int) -> None:
         _write_recovery_conf(ddir, cp["name"])
         _check_cancel(job_id)
 
-        # 4) 启动实例，WAL 重放到核对点自动暂停
+        # 5) 启动实例，WAL 重放到核对点自动暂停
         state.update_job(job_id, status="recovering", detail="WAL 重放中")
         _pg_ctl(ddir, "start", logfile)
         started_pg = True
         _wait_replay_paused(job_id, cp, ddir)
 
-        # 5) 校验确实停在核对点（杜绝半库报成功），随后 promote 并核查只读
+        # 6) 校验确实停在核对点（杜绝半库报成功），随后 promote 并核查只读
         state.update_job(job_id, status="verifying", detail="校验恢复位点并提升")
         rows = _verify_and_promote(cp, ddir)
-        state.update_job(job_id, status="ready",
-                         detail=f"恢复完成，目标库只读，samples 现有 {rows} 行",
-                         ready_at=state.now(), error=None, log_tail=None)
+        # 7) 发布 ready 与“备份被判坏”互斥：核验失败后绝不把该代恢复报为 ready
+        with verifier.ready_guard(backup["id"]):
+            state.update_job(job_id, status="ready",
+                             detail=f"恢复完成，目标库只读，samples 现有 {rows} 行",
+                             ready_at=state.now(), error=None, log_tail=None)
     except Cancelled:
         if started_pg:
             stop_instance(ddir)
         state.update_job(job_id, status="cancelled", detail="已取消")
+        _restore_parked(parked, job_id)
     except Exception as e:  # noqa: BLE001 - 任何失败都如实标记，绝不上报成功
         if started_pg:
             stop_instance(ddir)
         state.update_job(job_id, status="failed", error=str(e)[-4000:],
                          log_tail=_tail(logfile) if os.path.exists(logfile) else None)
+        # 本任务未就绪：把此前被停掉、尚可用的 ready 实例拉回，保证仍可查询
+        _restore_parked(parked, job_id)
 
 
 def _check_cancel(job_id: int) -> None:
@@ -167,7 +189,7 @@ def _missing_segments(backup: dict, cp: dict, seg_size: int) -> list[str]:
     start = lsn_to_int(backup["start_lsn"])
     end = lsn_to_int(cp["restore_lsn"])
     tli = int(backup.get("timeline") or 1)
-    backup_wal_dir = os.path.join(backup["path"], "pg_wal")
+    backup_wal_dir = backup_wal_path(backup)
     missing = []
     seg, last = start // seg_size, end // seg_size
     while seg <= last and len(missing) <= 10000:
@@ -180,12 +202,21 @@ def _missing_segments(backup: dict, cp: dict, seg_size: int) -> list[str]:
     return missing
 
 
+def backup_wal_path(backup: dict) -> str:
+    """备份自带 WAL 目录；兼容旧版把 WAL 放在 pg_wal 之外的历史布局。"""
+    p = backup["path"]
+    for cand in (os.path.join(p, "pg_wal"), os.path.join(p, "pg_xlog")):
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(p, "pg_wal")
+
+
 def _write_recovery_conf(ddir: str, cp_name: str) -> None:
     # recovery.signal 触发归档恢复模式；配置追加到 auto.conf 末尾（后写优先）
     open(os.path.join(ddir, "recovery.signal"), "w").close()
     conf = f"""
 # ---- pitr-api 追加：PITR 恢复到命名核对点，提升后只读 ----
-restore_command = 'cp {config.ARCHIVE_DIR}/%f %p'
+restore_command = '{config.RESTORE_COMMAND}'
 recovery_target_name = '{cp_name}'
 recovery_target_action = 'pause'
 recovery_target_timeline = 'latest'
@@ -289,13 +320,45 @@ def stop_instance(ddir: str) -> None:
         pass
 
 
-def _supersede_ready(current_job_id: int) -> None:
+def _supersede_ready(current_job_id: int) -> list[dict]:
+    """停掉当前 ready 实例，但**保留数据目录**：新任务若因备份判坏失败，
+    必须把原 ready 实例原样拉起，保证"已就绪的独立只读库仍可查询"。
+
+    返回可回滚的清单 [{"job_id", "data_dir"}]。
+    """
+    parked = []
     for j in state.all_rows("SELECT * FROM jobs WHERE status='ready'"):
-        if j.get("data_dir"):
-            stop_instance(j["data_dir"])
-            shutil.rmtree(j["data_dir"], ignore_errors=True)
+        ddir = j.get("data_dir")
+        if ddir:
+            stop_instance(ddir)
+            if os.path.isdir(ddir):
+                parked.append({"job_id": j["id"], "data_dir": ddir})
         state.update_job(j["id"], status="superseded",
                          detail=f"被恢复任务 #{current_job_id} 取代（一次只恢复一项）")
+    return parked
+
+
+def _restore_parked(parked: list[dict], current_job_id: int) -> list[str]:
+    """新任务未能就绪时，把被停掉的旧 ready 实例拉回并恢复其 ready 状态。"""
+    restored = []
+    for item in parked:
+        ddir = item["data_dir"]
+        try:
+            if not os.path.isdir(ddir):
+                raise RuntimeError("数据目录已不存在")
+            if not _postgres_alive(ddir):
+                _pg_ctl(ddir, "start", os.path.join(ddir, "server.log"))
+            with _control_conn() as con:
+                con.execute("SELECT 1")
+            state.update_job(
+                item["job_id"], status="ready",
+                detail=f"恢复任务 #{current_job_id} 失败/取消，本实例已自动拉起，可继续查询")
+            restored.append(ddir)
+        except Exception as e:  # noqa: BLE001 - 拉不起来就如实记录
+            state.update_job(
+                item["job_id"], status="failed",
+                error=f"被任务 #{current_job_id} 取代后自动拉起失败：{e}")
+    return restored
 
 
 def _pg_ctl(ddir: str, action: str, logfile: str) -> None:

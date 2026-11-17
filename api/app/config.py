@@ -14,6 +14,9 @@ BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
 RECOVERY_DIR = os.getenv("RECOVERY_DIR", "/recoveries")
 STATE_DB = os.getenv("STATE_DB", "/state/api.db")
 
+# 恢复实例的 restore_command（默认从只读归档目录取 WAL）
+RESTORE_COMMAND = os.getenv("RESTORE_COMMAND") or f"cp {ARCHIVE_DIR}/%f %p"
+
 # 恢复出来的独立只读实例监听地址（容器内）
 RECOVERY_HOST = os.getenv("RECOVERY_HOST", "127.0.0.1")
 RECOVERY_PORT = int(os.getenv("RECOVERY_PORT", "55433"))

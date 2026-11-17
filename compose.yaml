@@ -44,6 +44,8 @@ services:
       STATE_DB: /state/api.db
       RECOVERY_PORT: "55433"
       RECOVERY_TIMEOUT: "180"
+      # 核验工具（API 镜像为 postgres:16，自带同版本 pg_verifybackup）
+      PG_VERIFYBACKUP: pg_verifybackup
     volumes:
       - wal_archive:/wal_archive:ro   # 归档只读挂载，API 不可能改写 WAL
       - backups:/backups

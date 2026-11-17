@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import backuper, config, recoverer, source, state
+from . import backuper, config, recoverer, source, state, verifier
 from .walutil import lsn_to_int
 
 _stop = threading.Event()
@@ -19,6 +19,8 @@ DESCRIPTION = """
 面向水质数仓值班场景的单实例时间点恢复（PITR）服务。
 
 * 基准备份：`pg_basebackup` 在线物理拷贝，源库全程可写；
+* 备份核验：`pg_verifybackup` 检查已完成备份及其自带 WAL，返回损坏明细、
+  核验时间与备份代次；核验失败/中断会阻断该代及更早备份的新恢复；
 * 核对点：`pg_create_restore_point` 命名恢复点 + WAL 归档齐备检查；
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
   产出**独立只读**实例；跨点后才提交的事务不会出现；
@@ -79,6 +81,7 @@ async def lifespan(_app: FastAPI):
               os.path.dirname(config.STATE_DB) or "."):
         os.makedirs(d, exist_ok=True)
     state.init_db()
+    verifier.recover_after_restart()   # 上次中断的核验 → interrupted（绝不报通过）
     recoverer.resume_after_restart()
     threading.Thread(target=_refresher_loop, name="refresher", daemon=True).start()
     threading.Thread(target=recoverer.dispatch_loop, args=(_stop,),
@@ -93,6 +96,7 @@ async def lifespan(_app: FastAPI):
             pass
     yield
     _stop.set()
+    verifier.interrupt_all("服务停止")
     for j in state.all_rows(
         "SELECT * FROM jobs WHERE status IN"
         " ('preparing','recovering','verifying','ready')"
@@ -136,8 +140,8 @@ def _ensure_no_active_job() -> None:
 @app.get("/", summary="服务信息")
 def root():
     return {"service": "水质数仓 PITR 恢复服务", "docs": "/docs",
-            "api": ["/api/health", "/api/basebackup", "/api/checkpoints",
-                    "/api/recoveries"]}
+            "api": ["/api/health", "/api/basebackup", "/api/basebackup/{id}/verify",
+                    "/api/verifications", "/api/checkpoints", "/api/recoveries"]}
 
 
 @app.get("/api/health", summary="健康检查")
@@ -164,6 +168,7 @@ def backup_status():
             " ORDER BY id DESC LIMIT 1"),
         "history": state.all_rows(
             "SELECT * FROM backups ORDER BY id DESC LIMIT 10"),
+        "integrity_gate": verifier.gate_status(),
     }
 
 
@@ -175,7 +180,66 @@ def make_backup(force: bool = Query(
         bid = backuper.start_backup(force=force)
     except backuper.BusyError as e:
         raise HTTPException(409, str(e))
-    return {"id": bid, "status": "running"}
+    return {"id": bid, "backup_generation": bid, "status": "running"}
+
+
+# ------------------------------------------------------------------ 备份核验
+
+@app.post("/api/basebackup/{backup_id}/verify", tags=["verify"], status_code=202,
+          summary="核验指定备份代次（pg_verifybackup，含备份自带 WAL）")
+def verify_backup(backup_id: int):
+    if not backuper.get(backup_id):
+        raise HTTPException(404, f"备份代次 #{backup_id} 不存在")
+    try:
+        v = verifier.start_verification(backup_id)
+    except verifier.VerifyError as e:
+        raise HTTPException(409, str(e))
+    return v
+
+
+@app.get("/api/basebackup/{backup_id}/verify", tags=["verify"],
+         summary="某备份代次最近一次核验结果")
+def get_backup_verification(backup_id: int):
+    if not backuper.get(backup_id):
+        raise HTTPException(404, f"备份代次 #{backup_id} 不存在")
+    v = verifier.latest_for_backup(backup_id)
+    if not v:
+        raise HTTPException(404, f"备份代次 #{backup_id} 尚无核验记录")
+    return v
+
+
+@app.get("/api/basebackup/{backup_id}/verifications", tags=["verify"],
+         summary="某备份代次的全部核验记录")
+def list_backup_verifications(backup_id: int):
+    if not backuper.get(backup_id):
+        raise HTTPException(404, f"备份代次 #{backup_id} 不存在")
+    return verifier.list_for_backup(backup_id)
+
+
+@app.get("/api/verifications", tags=["verify"], summary="核验记录列表（含阻断状态）")
+def list_verifications(limit: int = Query(50, ge=1, le=500)):
+    return {
+        "integrity_gate": verifier.gate_status(),
+        "items": verifier.list_all(limit),
+    }
+
+
+@app.get("/api/verifications/{verification_id}", tags=["verify"],
+         summary="核验详情（损坏信息、核验时间、备份代次）")
+def get_verification(verification_id: int):
+    v = verifier.get_verification(verification_id)
+    if not v:
+        raise HTTPException(404, f"核验任务 #{verification_id} 不存在")
+    return v
+
+
+@app.delete("/api/verifications/{verification_id}", tags=["verify"],
+            summary="中断进行中的核验（结果记 interrupted，绝不报通过）")
+def cancel_verification(verification_id: int):
+    try:
+        return verifier.cancel_verification(verification_id)
+    except verifier.VerifyError as e:
+        raise HTTPException(404, str(e))
 
 
 # ------------------------------------------------------------------ 核对点
@@ -216,6 +280,10 @@ def start_recovery(body: RecoveryIn):
     cp = _cp_or_404(body.checkpoint)
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
+    try:
+        verifier.ensure_recovery_allowed()
+    except verifier.VerifyError as e:
+        raise HTTPException(409, str(e))
     _ensure_no_active_job()
     jid = state.execute(
         "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
@@ -244,6 +312,10 @@ def retry_recovery(job_id: int):
     cp = _cp_or_404(job["checkpoint_name"])
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
+    try:
+        verifier.ensure_recovery_allowed()
+    except verifier.VerifyError as e:
+        raise HTTPException(409, str(e))
     _ensure_no_active_job()
     jid = state.execute(
         "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
